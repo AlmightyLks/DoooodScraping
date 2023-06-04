@@ -2,8 +2,8 @@
 using System.Diagnostics;
 
 Log.Logger = new LoggerConfiguration()
-    .WriteTo.Console(outputTemplate:"[{Timestamp:HH:mm:ss.fff} {Level:u3}] {Message:lj}{NewLine}{Exception}")
-    .MinimumLevel.Debug()
+    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss.fff} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+    .MinimumLevel.Information()
     .CreateLogger();
 
 string outputFolder = "output";
@@ -14,7 +14,7 @@ if (Directory.Exists(outputFolder))
     Directory.Delete(outputFolder, true);
 Directory.CreateDirectory(outputFolder);
 
-var client = new DoooodClient(outputFolder);
+var client = new DoooodClient(outputFolder, maxDegreeOfParallelism: 5);
 
 var sw = Stopwatch.StartNew();
 await Parallel.ForEachAsync(urls, async (url, _) =>

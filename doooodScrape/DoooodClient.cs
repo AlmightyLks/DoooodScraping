@@ -6,6 +6,7 @@ public class DoooodClient
     // Static constants used for requesting, initialized at first contact with DoooodClient
     private const string UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36";
     private static readonly HttpClient Client = new HttpClient();
+
     static DoooodClient()
     {
         Client.DefaultRequestHeaders.TryAddWithoutValidation("user-agent", UserAgent);
@@ -14,11 +15,15 @@ public class DoooodClient
 
     private static readonly ILogger Logger = Log.ForContext<DoooodClient>();
 
-    private string _outputFolder;
+    private readonly long _splitSize;
+    private readonly string _outputFolder;
+    private readonly int _maxDegreeOfParallelism;
 
-    public DoooodClient(string outputFolder)
+    public DoooodClient(string outputFolder, int? maxDegreeOfParallelism = null, long? splitSize = null)
     {
         _outputFolder = outputFolder;
+        _splitSize = splitSize ?? 2_097_152; // 2 * 1024 * 1024 = 2MiB
+        _maxDegreeOfParallelism = maxDegreeOfParallelism ?? 3;
     }
     public async Task DownloadVideoAsync(string url)
     {
@@ -39,7 +44,7 @@ public class DoooodClient
     private async Task<string> GetStreamUrlAsync(string url)
     {
         var request = RequestBuilder.BuildEmbedRequest(url);
-        var response = await Client!.SendAsync(request);
+        var response = await Client.SendAsync(request);
         var responseBody = await response.Content.ReadAsStringAsync();
 
         var passLink = ExtractLink(responseBody);
@@ -48,7 +53,7 @@ public class DoooodClient
         request.Dispose();
 
         request = RequestBuilder.BuildPassMd5Request(link);
-        response = await Client!.SendAsync(request);
+        response = await Client.SendAsync(request);
         var result = await response.Content.ReadAsStringAsync();
         request.Dispose();
         response.Dispose();
@@ -76,50 +81,53 @@ public class DoooodClient
     private async Task DownloadVideoFromStreamLinkAsync(string url, string fileName)
     {
         var request = RequestBuilder.BuildDownloadRequest(url, HttpMethod.Head);
-        var response = await Client!.SendAsync(request);
+        var response = await Client.SendAsync(request);
         var etag = response.Headers.ETag?.ToString();
         var contentLength = response.Content.Headers.ContentLength ?? 0;
 
         // Downloads are limited to around 150Kbit/s... Just enough to stream it as a genuine person.
-        // So, split up the download by downloading 15 different byte ranges
-        // 1. Asynchronously requesting different sections will slash the download time by 15
+        // So, determine how many splits to make, to download X different byte ranges, each of Y bytes
+        // 1. Asynchronously requesting different sections will slash the download time by X times
         // 2. The beginning of a download is always a little faster at first, before the speed rate-limit kicks in
         // 
         // Problem: It is possible that with this approach we hit a request rate-limit...
         //          Not yet encountered though.
-        const int Splits = 15;
 
-        var lengths = contentLength / Splits;
-        var remainder = contentLength % lengths;
+        int splits = (int)(contentLength / _splitSize) + 1;
+        var remainder = contentLength % _splitSize;
 
-        Logger.Debug("Downloading {FileName} the Size of {Size:0.00}MB in {Splits}x {SplitSize}MB splits", fileName, (contentLength / 1024f / 1024f), Splits, (lengths / 1024f / 1024f));
+        var sizeInMB = (contentLength / 1024f / 1024f);
+        var eta = TimeSpan.FromSeconds(1 + (contentLength / 5_000_000D)); // Estimated 5Mbit/s + 1 second overhead
+        Logger.Debug("Downloading {FileName} from {VideoUrl} ...", fileName, url);
+        Logger.Information("Downloading {FileName} with a Size of {SizeInMiB:0.00}MB ({Size} Bytes) in {Splits} splits. ETA: {ETA:mm':'ss'.'fff}", fileName, sizeInMB, contentLength, splits, eta);
 
-        var itLengths = new List<long>();
-        for (int i = 1; i < Splits + 1; i++)
-            itLengths.Add(lengths * i);
-
-        // Temp folder to store the 15 segments
+        // Temp folder to store the x amount of segments
         var tempSegmentFolderName = Path.Combine(_outputFolder, Path.GetFileNameWithoutExtension(fileName));
         Directory.CreateDirectory(tempSegmentFolderName);
 
-        await Parallel.ForEachAsync(itLengths, new ParallelOptions() { MaxDegreeOfParallelism = 3 }, async (value, _) =>
-        {
-            var index = itLengths.FindIndex(x => x == value);
-            var from = value - (contentLength / Splits);
-            var to = index == Splits ? value + remainder : value - 1;
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, splits),
+            new ParallelOptions() { MaxDegreeOfParallelism = _maxDegreeOfParallelism },
+            async (value, _) =>
+            {
+                var from = value * _splitSize;
+                var to = value == splits
+                ? (value * _splitSize) + remainder
+                : ((value + 1) * _splitSize) - 1;
 
-            Logger.Debug("Fetching {from} to {to} for {fileName}...", from, to, fileName);
+                Logger.Debug("Fetching {from} to {to} for {fileName}...", from, to, fileName);
 
-            //Range: bytes=82640896-136409129
-            var request = RequestBuilder.BuildDownloadRequest(url, HttpMethod.Get, etag, $"bytes={from}-{to}");
-            var response = await Client!.SendAsync(request);
+                // Range: bytes=82640896-136409129
+                var request = RequestBuilder.BuildDownloadRequest(url, HttpMethod.Get, etag, $"bytes={from}-{to}");
+                var response = await Client.SendAsync(request);
+                response.EnsureSuccessStatusCode();
 
-            // Write http response byte stream into segment file
-            var tempSegmentName = Path.Combine(tempSegmentFolderName, index.ToString());
-            using var fileStream = File.Create(tempSegmentName);
-            var httpStream = await response.Content.ReadAsStreamAsync();
-            await httpStream.CopyToAsync(fileStream);
-        });
+                // Write http response byte stream into segment file
+                var tempSegmentName = Path.Combine(tempSegmentFolderName, value.ToString());
+                using var fileStream = File.Create(tempSegmentName);
+                var httpStream = await response.Content.ReadAsStreamAsync();
+                await httpStream.CopyToAsync(fileStream);
+            });
 
         // Create final file, go through folder with segments and order by segment file name (index)
         using (var fileStream = File.Create(Path.Combine(_outputFolder, fileName)))
